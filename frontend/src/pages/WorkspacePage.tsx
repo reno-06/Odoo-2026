@@ -1,9 +1,21 @@
-import { useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Download, Eye, Pencil, Plus, Printer, Search, Trash2 } from 'lucide-react';
-import type { AppRecord, FormField, ModuleKey, RecordData } from '../types';
+import type { AppRecord, FieldOption, FormField, ModuleKey, RecordData } from '../types';
 import { EmptyState, Modal, PageHeading, StatusBadge } from '../components/ui';
+import { fetchInvoicePdf } from '../services/api';
 
 const choice = (...values: string[]) => values.map((value) => ({ label: value, value }));
+const statusChoices: Partial<Record<ModuleKey, string[]>> = {
+  products: ['Active', 'Inactive', 'Archived'],
+  plans: ['Active', 'Inactive', 'Archived'],
+  customers: ['Active', 'Inactive'],
+  quotations: ['Draft', 'Quotation', 'Confirmed', 'Rejected', 'Expired'],
+  subscriptions: ['Draft', 'Quotation', 'Confirmed', 'Active', 'Paused', 'Closed', 'Expired', 'Cancelled'],
+  invoices: ['Draft', 'Confirmed', 'Overdue', 'Paid', 'Cancelled'],
+  discounts: ['Active', 'Inactive', 'Expired'],
+  payments: ['Pending', 'Completed', 'Failed', 'Refunded'],
+};
+const productTypeChoices = ['Digital service', 'Service', 'Physical product'];
 
 const moduleConfig: Record<ModuleKey, {
   title: string;
@@ -103,7 +115,6 @@ const moduleConfig: Record<ModuleKey, {
       { key: 'issueDate', label: 'Issue date', type: 'date', required: true },
       { key: 'dueDate', label: 'Due date', type: 'date', required: true },
       { key: 'total', label: 'Total', type: 'number', min: 0, required: true },
-      { key: 'status', label: 'Payment status', type: 'select', required: true, options: choice('Draft', 'Confirmed', 'Paid', 'Overdue', 'Cancelled') },
       { key: 'notes', label: 'Notes', type: 'textarea' },
     ],
   },
@@ -150,7 +161,7 @@ function displayValue(key: string, value: unknown) {
   return String(value);
 }
 
-function validate(values: RecordData, fields: FormField[]) {
+function validate(values: RecordData, fields: FormField[], module: ModuleKey) {
   const errors: Record<string, string> = {};
   for (const field of fields) {
     const value = values[field.key];
@@ -174,15 +185,41 @@ function validate(values: RecordData, fields: FormField[]) {
   const end = values[endKey];
   if (start && end && String(end) < String(start)) errors[endKey] = 'End date cannot be earlier than start date.';
   if (values.issueDate && values.dueDate && String(values.dueDate) < String(values.issueDate)) errors.dueDate = 'Due date cannot be earlier than issue date.';
+  if ((module === 'discounts' && Number(values.value) <= 0) || (module === 'payments' && Number(values.amount) <= 0)) {
+    const key = module === 'discounts' ? 'value' : 'amount';
+    errors[key] = 'Enter an amount greater than zero.';
+  }
+  if (module === 'discounts' && values.type === 'Percentage' && Number(values.value) > 100) {
+    errors.value = 'Percentage discounts cannot exceed 100%.';
+  }
   return errors;
 }
 
-export default function WorkspacePage({ module, records, onSave, onDelete, onToggle }: {
+type Query = { page?: number; pageSize?: number; q?: string; status?: string; type?: string };
+type PageInfo = { page: number; pageSize: number; total: number; pageCount: number };
+
+export default function WorkspacePage({
+  module,
+  records,
+  loading,
+  pageInfo,
+  fieldOptions,
+  onSave,
+  onDelete,
+  onToggle,
+  onAction,
+  onQueryChange,
+}: {
   module: ModuleKey;
   records: AppRecord[];
-  onSave: (value: RecordData, record?: AppRecord) => void;
-  onDelete: (record: AppRecord) => void;
-  onToggle: (record: AppRecord) => void;
+  loading: boolean;
+  pageInfo: PageInfo;
+  fieldOptions?: Partial<Record<string, FieldOption[]>>;
+  onSave: (value: RecordData, record?: AppRecord) => Promise<void>;
+  onDelete: (record: AppRecord) => Promise<void>;
+  onToggle: (record: AppRecord) => Promise<void>;
+  onAction: (record: AppRecord, operation: string) => Promise<void>;
+  onQueryChange: (module: ModuleKey, query: Query) => void;
 }) {
   const config = moduleConfig[module];
   const [query, setQuery] = useState('');
@@ -192,8 +229,12 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
   const [selected, setSelected] = useState<AppRecord | null>(null);
   const [values, setValues] = useState<RecordData>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const statuses = useMemo(() => Array.from(new Set(records.map((record) => record.status))), [records]);
-  const productTypes = useMemo(() => Array.from(new Set(records.map((record) => String(record.type ?? '')).filter(Boolean))), [records]);
+  const [formError, setFormError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [page, setPage] = useState(1);
+  const [reloadVersion, setReloadVersion] = useState(0);
+  const statuses = statusChoices[module] ?? [];
+  const productTypes = productTypeChoices;
   const filtered = records.filter((record) => {
     const matchesText = Object.values(record).some((value) => String(value).toLowerCase().includes(query.toLowerCase()));
     return matchesText &&
@@ -201,10 +242,23 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
       (module !== 'products' || typeFilter === 'All product types' || record.type === typeFilter);
   });
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      onQueryChange(module, {
+        page,
+        pageSize: 100,
+        ...(query.trim() ? { q: query.trim() } : {}),
+        ...(filter !== 'All status' ? { status: filter } : {}),
+        ...(module === 'products' && typeFilter !== 'All product types' ? { type: typeFilter } : {}),
+      });
+    }, query ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [module, page, query, filter, typeFilter, reloadVersion, onQueryChange]);
+
   const beginCreate = () => {
     const initial: RecordData = {};
     for (const field of config.fields) {
-      if (field.type === 'select') initial[field.key] = field.options?.[0]?.value ?? '';
+      if (field.type === 'select') initial[field.key] = (fieldOptions?.[field.key] ?? field.options)?.[0]?.value ?? '';
       else if (field.type === 'number') initial[field.key] = field.min ?? 0;
       else initial[field.key] = '';
     }
@@ -215,28 +269,122 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
     if (module === 'payments') initial.status = 'Pending';
     setValues(initial);
     setErrors({});
+    setFormError('');
     setSelected(null);
     setDialog('create');
   };
 
   const beginEdit = (record: AppRecord) => {
     setSelected(record);
-    setValues({ ...record });
+    const editable: RecordData = { ...record };
+    for (const key of ['startDate', 'expiryDate', 'nextBilling', 'created', 'validUntil', 'issueDate', 'dueDate', 'starts', 'ends', 'date', 'availableFrom', 'availableUntil']) {
+      if (typeof editable[key] === 'string') editable[key] = String(editable[key]).slice(0, 10);
+    }
+    if (module === 'plans') editable.product = String(record.productId ?? '');
+    if (module === 'quotations') {
+      editable.customer = String(record.customerId ?? '');
+      const item = (record.items as unknown as Array<Record<string, unknown>> | undefined)?.[0];
+      if (item) {
+        editable.product = item.planId ? `plan:${item.planId}` : `product:${item.productId}`;
+        editable.quantity = Number(item.quantity ?? 1);
+        editable.unitPrice = Number(item.unitPrice ?? 0);
+        editable.tax = Number(item.taxRate ?? 0);
+      }
+      delete editable.items;
+    }
+    if (module === 'invoices') delete editable.items;
+    if (module === 'subscriptions') {
+      editable.name = String(record.customerId ?? '');
+      editable.plan = String(record.planId ?? '');
+    }
+    if (module === 'invoices') editable.name = String(record.customerId ?? '');
+    if (module === 'payments') {
+      editable.name = String(record.customerId ?? '');
+      editable.invoice = String(record.invoiceId ?? '');
+    }
+    if (module === 'discounts') {
+      const products = record.products as unknown as Array<Record<string, unknown>> | undefined;
+      const plans = record.plans as unknown as Array<Record<string, unknown>> | undefined;
+      if (products?.[0]) editable.appliesTo = `product:${products[0].id}`;
+      else if (plans?.[0]) editable.appliesTo = `plan:${plans[0].id}`;
+    }
+    setValues(editable);
     setErrors({});
+    setFormError('');
     setDialog('edit');
   };
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const validationErrors = validate(values, config.fields);
+    const validationErrors = validate(values, config.fields, module);
     setErrors(validationErrors);
     if (Object.keys(validationErrors).length > 0) return;
-    onSave(values, selected ?? undefined);
-    setDialog(null);
+    setSaving(true);
+    setFormError('');
+    try {
+      await onSave(values, selected ?? undefined);
+      setPage(1);
+      setReloadVersion((version) => version + 1);
+      setDialog(null);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Unable to save this record.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const exportCsv = () => {
+    const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
+    const csv = [
+      config.columns.map((column) => escape(column.label)).join(','),
+      ...filtered.map((record) => config.columns.map(({ key }) => escape(record[key])).join(',')),
+    ].join('\r\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${module}.csv`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const downloadInvoice = async (record: AppRecord) => {
+    try {
+      const blob = await fetchInvoicePdf(String(record.dbId ?? record.id));
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${record.id}.pdf`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Unable to download invoice PDF.');
+    }
+  };
+  const runAction = async (record: AppRecord, operation: string) => {
+    setFormError('');
+    try {
+      await onAction(record, operation);
+      setPage(1);
+      setReloadVersion((version) => version + 1);
+      setDialog(null);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Unable to complete this action.');
+    }
+  };
+  const runDelete = async (record: AppRecord) => {
+    setPage(1);
+    await onDelete(record);
+    setReloadVersion((version) => version + 1);
+  };
+  const runToggle = async (record: AppRecord) => {
+    setPage(1);
+    await onToggle(record);
+    setReloadVersion((version) => version + 1);
   };
 
   const openDetail = (record: AppRecord) => {
     setSelected(record);
+    setFormError('');
     setDialog('detail');
   };
 
@@ -250,14 +398,16 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
         <div className="records-toolbar">
           <div className="records-heading"><div><h2>All {config.title.toLowerCase()}</h2><span className="record-count">{records.length} records</span></div></div>
           <div className="records-controls">
-            <label className="table-search"><Search size={16} /><input placeholder={`Search ${config.title.toLowerCase()}...`} value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-            {module === 'products' && <select className="select-compact" aria-label="Filter by product type" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option>All product types</option>{productTypes.map((type) => <option key={type}>{type}</option>)}</select>}
-            <select className="select-compact" aria-label="Filter by status" value={filter} onChange={(event) => setFilter(event.target.value)}>
+            <label className="table-search"><Search size={16} /><input placeholder={`Search ${config.title.toLowerCase()}...`} value={query} onChange={(event) => { setPage(1); setQuery(event.target.value); }} /></label>
+            {module === 'products' && <select className="select-compact" aria-label="Filter by product type" value={typeFilter} onChange={(event) => { setPage(1); setTypeFilter(event.target.value); }}><option>All product types</option>{productTypes.map((type) => <option key={type}>{type}</option>)}</select>}
+            <select className="select-compact" aria-label="Filter by status" value={filter} onChange={(event) => { setPage(1); setFilter(event.target.value); }}>
               <option>All status</option>{statuses.map((status) => <option key={status}>{status}</option>)}
             </select>
-            <button type="button" className="button button-secondary export-button" onClick={() => window.print()}><Download size={15} /> Export</button>
+            <button type="button" className="button button-secondary export-button" onClick={exportCsv}><Download size={15} /> Export</button>
           </div>
         </div>
+        {loading && <div className="table-loading" role="status">Loading records…</div>}
+        {formError && !dialog && <div className="app-error" role="alert">{formError}</div>}
         {filtered.length === 0 ? <EmptyState title="No records found" description="Try a different search or add your first record." /> : (
           <div className="table-wrap">
             <table className="data-table">
@@ -275,15 +425,15 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
                   <td><div className="row-actions">
                     <button type="button" title={`View ${config.singular}`} aria-label={`View ${config.singular}`} onClick={() => openDetail(record)}><Eye size={16} /></button>
                     <button type="button" title={`Edit ${config.singular}`} aria-label={`Edit ${config.singular}`} onClick={() => beginEdit(record)}><Pencil size={15} /></button>
-                    {module === 'plans' && <button type="button" title={record.status === 'Active' ? 'Deactivate plan' : 'Activate plan'} aria-label="Toggle plan status" onClick={() => onToggle(record)}><span className={`toggle ${record.status === 'Active' ? 'toggle-on' : ''}`} /></button>}
-                    <button type="button" title={`Delete ${config.singular}`} aria-label={`Delete ${config.singular}`} className="delete-action" onClick={() => onDelete(record)}><Trash2 size={15} /></button>
+                    {module === 'plans' && <button type="button" title={record.status === 'Active' ? 'Deactivate plan' : 'Activate plan'} aria-label="Toggle plan status" onClick={() => void runToggle(record)}><span className={`toggle ${record.status === 'Active' ? 'toggle-on' : ''}`} /></button>}
+                    <button type="button" title={`Delete ${config.singular}`} aria-label={`Delete ${config.singular}`} className="delete-action" onClick={() => void runDelete(record)}><Trash2 size={15} /></button>
                   </div></td>
                 </tr>
               ))}</tbody>
             </table>
           </div>
         )}
-        <div className="table-footer"><span>Showing <strong>{filtered.length ? 1 : 0}–{filtered.length}</strong> of <strong>{filtered.length}</strong> results</span><div className="pagination"><button type="button" disabled>Previous</button><button type="button" className="pagination-current">1</button><button type="button" disabled>Next</button></div></div>
+        <div className="table-footer"><span>Showing <strong>{pageInfo.total ? (pageInfo.page - 1) * pageInfo.pageSize + 1 : 0}–{Math.min(pageInfo.page * pageInfo.pageSize, pageInfo.total)}</strong> of <strong>{pageInfo.total}</strong> results</span><div className="pagination"><button type="button" disabled={pageInfo.page <= 1 || loading} onClick={() => setPage((value) => Math.max(1, value - 1))}>Previous</button><button type="button" className="pagination-current">{pageInfo.page}</button><button type="button" disabled={pageInfo.page >= pageInfo.pageCount || loading} onClick={() => setPage((value) => Math.min(pageInfo.pageCount, value + 1))}>Next</button></div></div>
       </section>
 
       {dialog && dialog !== 'detail' && (
@@ -293,8 +443,8 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
               {config.fields.map((field) => (
                 <label key={field.key} className={`form-field ${field.type === 'textarea' ? 'field-full' : ''}`}>
                   <span>{field.label}{field.required && <i> *</i>}</span>
-                  {field.type === 'select' ? <select value={String(values[field.key] ?? '')} onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))}>
-                    <option value="">Select {field.label.toLowerCase()}</option>{field.options?.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  {field.type === 'select' ? <select required={field.required} value={String(values[field.key] ?? '')} onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))}>
+                    <option value="">Select {field.label.toLowerCase()}</option>{(fieldOptions?.[field.key] ?? field.options)?.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                   </select> : field.type === 'textarea' ? <textarea rows={3} placeholder={field.placeholder} value={String(values[field.key] ?? '')} onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))} /> :
                     <input type={field.type ?? 'text'} min={field.type === 'number' ? field.min ?? 0 : undefined} step={field.type === 'number' ? 'any' : undefined} placeholder={field.placeholder} value={String(values[field.key] ?? '')} onChange={(event) => setValues((current) => ({ ...current, [field.key]: field.type === 'number' ? event.target.value : event.target.value }))} />}
                   {errors[field.key] && <small className="field-error">{errors[field.key]}</small>}
@@ -302,20 +452,27 @@ export default function WorkspacePage({ module, records, onSave, onDelete, onTog
               ))}
             </div>
             {module === 'quotations' && <div className="quote-total"><span>Estimated total including tax</span><strong>${quoteTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></div>}
-            <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setDialog(null)}>Cancel</button><button type="submit" className="button button-primary">{dialog === 'edit' ? 'Save changes' : `Create ${config.singular}`}</button></div>
+            {formError && <div className="settings-error" role="alert">{formError}</div>}
+            <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setDialog(null)} disabled={saving}>Cancel</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? 'Saving…' : dialog === 'edit' ? 'Save changes' : `Create ${config.singular}`}</button></div>
           </form>
         </Modal>
       )}
 
       {dialog === 'detail' && selected && (
         <Modal title={selected.id} description={`${config.singular[0].toUpperCase()}${config.singular.slice(1)} details`} onClose={() => setDialog(null)} size="wide">
+          {formError && <div className="settings-error" role="alert">{formError}</div>}
           <div className="detail-grid">
             {config.columns.map((column) => <div className="detail-item" key={column.key}><span>{column.label}</span><strong>{column.key === 'status' ? <StatusBadge status={String(selected[column.key])} /> : displayValue(column.key, selected[column.key])}</strong></div>)}
             {Object.entries(selected).filter(([key]) => !config.columns.some((column) => column.key === key) && key !== 'id').map(([key, value]) => <div className="detail-item" key={key}><span>{key.replace(/[A-Z]/g, (letter) => ` ${letter.toLowerCase()}`).replace(/^./, (letter) => letter.toUpperCase())}</span><strong>{displayValue(key, value)}</strong></div>)}
           </div>
-          {module === 'invoices' && <div className="invoice-preview-note"><Printer size={16} /> Print-ready invoice preview. PDF export will be available when connected to your billing service.</div>}
+          {module === 'invoices' && <div className="invoice-preview-note"><Printer size={16} /> Download a print-ready PDF generated from the saved invoice.</div>}
           <div className="form-actions">
-            {module === 'invoices' && <><button type="button" className="button button-secondary" onClick={() => window.print()}><Printer size={16} /> Print invoice</button><button type="button" className="button button-secondary" onClick={() => window.alert('PDF export is not connected in this frontend prototype.')}><Download size={15} /> Download PDF</button></>}
+            {module === 'invoices' && <><button type="button" className="button button-secondary" onClick={() => window.print()}><Printer size={16} /> Print invoice</button><button type="button" className="button button-secondary" onClick={() => void downloadInvoice(selected)}><Download size={15} /> Download PDF</button>{selected.status === 'Draft' && <button type="button" className="button button-primary" onClick={() => void runAction(selected, 'issue')}>Issue invoice</button>}{selected.status !== 'Paid' && selected.status !== 'Draft' && <button type="button" className="button button-primary" onClick={() => void runAction(selected, 'mark-paid')}>Mark paid</button>}</>}
+            {module === 'quotations' && selected.status !== 'Confirmed' && <button type="button" className="button button-primary" onClick={() => void runAction(selected, 'confirm')}>Confirm quotation</button>}
+            {module === 'quotations' && selected.status === 'Confirmed' && <button type="button" className="button button-primary" onClick={() => void runAction(selected, 'convert-to-subscription')}>Convert to subscription</button>}
+            {module === 'subscriptions' && selected.status === 'Active' && <button type="button" className="button button-secondary" onClick={() => void runAction(selected, 'pause')}>Pause</button>}
+            {module === 'subscriptions' && selected.status === 'Paused' && <button type="button" className="button button-secondary" onClick={() => void runAction(selected, 'resume')}>Resume</button>}
+            {module === 'subscriptions' && selected.status !== 'Closed' && selected.status !== 'Cancelled' && <button type="button" className="button button-secondary" onClick={() => void runAction(selected, 'cancel')}>Cancel subscription</button>}
             <button type="button" className="button button-secondary" onClick={() => setDialog(null)}>Close</button>
             <button type="button" className="button button-primary" onClick={() => beginEdit(selected)}>Edit details</button>
           </div>
