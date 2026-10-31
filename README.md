@@ -1,4 +1,4 @@
-# Brightloop
+# Brightloop 
 
 ### Subscription Management Platform
 
