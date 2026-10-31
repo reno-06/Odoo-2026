@@ -39,6 +39,3 @@ npm run dev
 npm run build
 ```
 
-## Project Status
-
-Frontend development in progress.
